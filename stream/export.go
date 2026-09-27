@@ -21,18 +21,6 @@ func (s *Stream) Sendable() bool {
 	return s.sendableLocked()
 }
 
-// PopSendFrame returns the next wire frame for this stream or nil when the
-// stream currently cannot send (empty queue or closed window).
-// PopSendFrame pops the next frame and, with the stream lock released,
-// reconciles scheduler readiness against the resulting state. Because this
-// notification runs after the pop and the scheduler uses a condition variable,
-// no readiness transition (new data, returned credit, pending FIN) is lost.
-func (s *Stream) PopSendFrame(maxPayload int) *frame.Frame {
-	f := s.PopSend(maxPayload)
-	s.refreshSendable()
-	return f
-}
-
 // Ack processes a cumulative ACK frame.
 func (s *Stream) Ack(ackedSeq uint64) { s.HandleAck(ackedSeq) }
 
@@ -89,11 +77,6 @@ func (s *Stream) WakeWriters() {
 
 // OffsetExport returns the durable stream offsets.
 func (s *Stream) OffsetExport() Offset { return s.Offset() }
-
-// PopSendFrameExport exposes a single send pop for recovery verification.
-func (s *Stream) PopSendFrameExport(maxPayload int) *frame.Frame {
-	return s.PopSend(maxPayload)
-}
 
 // PopSendRaw pops a frame without issuing a scheduler-readiness notification.
 // Callers that reconcile readiness externally must use this variant.

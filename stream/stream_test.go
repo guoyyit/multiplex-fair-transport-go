@@ -115,7 +115,7 @@ func TestReceiveWindowBackpressure(t *testing.T) {
 	// Pop the 4 windowed bytes; inFlight is now 4 and the remaining 6 bytes
 	// cannot even be queued because outstanding (inFlight 4 + queued) is at
 	// the 8-byte memory bound.
-	fr := s.PopSendFrame(1024)
+	fr := s.PopSendRaw(1024)
 	if fr == nil || len(fr.Payload) != 4 {
 		t.Fatalf("expected 4-byte frame, got %+v", fr)
 	}

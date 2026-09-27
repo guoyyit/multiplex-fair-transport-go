@@ -82,7 +82,7 @@ func TestRecoverStreamResumesOffsets(t *testing.T) {
 	}
 	// sequence numbers must continue past the crash, never restart at zero
 	if rs.Offset.SendAcked > 0 {
-		if f := rs.Stream.PopSendFrameExport(64); f != nil && f.Seq < rs.Offset.SendAcked {
+		if f := rs.Stream.PopSendRaw(64); f != nil && f.Seq < rs.Offset.SendAcked {
 			t.Fatalf("recovered frame seq=%d below acked=%d", f.Seq, rs.Offset.SendAcked)
 		}
 	}
