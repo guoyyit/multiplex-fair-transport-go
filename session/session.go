@@ -57,6 +57,7 @@ type Session struct {
 	streams   map[uint32]*streamEntry
 	acceptCh  chan *stream.Stream
 	nextID    uint32
+	stopping  bool // rejecting new streams, still draining
 	closed    bool
 	closeOnce sync.Once
 	aborted   bool
@@ -162,7 +163,7 @@ func (s *Session) OpenStream(ctx context.Context, priority, weight int) (*stream
 		priority = 0
 	}
 	s.mu.Lock()
-	if s.closed {
+	if s.closed || s.stopping {
 		s.mu.Unlock()
 		return nil, ErrSessionClosed
 	}
@@ -234,10 +235,10 @@ func (s *Session) SendFrame(f *frame.Frame) error {
 	return s.writeFrame(f)
 }
 
-// MarkSendable updates scheduler readiness.
+// MarkSendable updates scheduler readiness. Any transition to ready wakes the
+// send loop so newly enqueued data is transmitted without a missed wakeup.
 func (s *Session) MarkSendable(id uint32, sendable bool) {
-	s.sched.SetReady(id, sendable)
-	if sendable {
+	if s.sched.SetReady(id, sendable) && sendable {
 		s.kickFlush()
 	}
 }
@@ -336,8 +337,8 @@ func (s *Session) serveOne(id uint32) {
 		s.recordInflight(id, f.Seq, f.Payload)
 	}
 	if e.st.Sendable() {
+		// re-arm without kick: the sendLoop is already iterating its batch
 		s.sched.SetReady(id, true)
-		s.kickFlush()
 	}
 }
 
@@ -447,7 +448,7 @@ func (s *Session) handleOpen(f *frame.Frame) {
 		return // malformed open: ignore stream
 	}
 	s.mu.Lock()
-	if s.closed {
+	if s.closed || s.stopping {
 		s.mu.Unlock()
 		return
 	}
@@ -683,46 +684,67 @@ func (s *Session) CloseNow() error {
 }
 
 func (s *Session) closeGraceful(drain bool) error {
+	// Phase 1: enter "stopping" — reject new streams but keep sendLoop alive
+	// so queued data and FIN frames can still be transmitted and acked.
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
 		s.wg.Wait()
 		return nil
 	}
-	s.closed = true
+	s.stopping = true
 	entries := make([]*streamEntry, 0, len(s.streams))
 	for _, e := range s.streams {
 		entries = append(entries, e)
 	}
-	if s.doneCh != nil {
-		close(s.doneCh)
-	}
 	s.safeCloseAccept()
 	s.mu.Unlock()
 
+	drainedAll := true
 	if drain {
+		// Graceful shutdown first half-closes every still-open write side so
+		// a FIN is queued after the user's buffered data; the peer reader
+		// therefore observes a clean EOF rather than a reset.
+		for _, e := range entries {
+			_ = e.st.CloseWrite()
+		}
 		deadline := time.Now().Add(s.cfg.DrainTimeout)
 		for _, e := range entries {
 			remaining := time.Until(deadline)
 			if remaining <= 0 {
+				drainedAll = false
 				break
 			}
 			if !e.st.DrainWait(remaining) {
+				drainedAll = false
 				break
 			}
 		}
+	} else {
+		drainedAll = false
 	}
+
+	// Phase 2: fully close: stop background loops and the wire.
 	s.mu.Lock()
+	s.closed = true
 	conn := s.conn
+	if s.doneCh != nil {
+		select {
+		case <-s.doneCh:
+		default:
+			close(s.doneCh)
+		}
+	}
 	s.mu.Unlock()
 	if conn != nil {
 		_ = conn.Close()
 	}
-	// Cancel remaining streams outside the session lock; their terminal
-	// hooks call back into the session.
-	for _, e := range entries {
-		if e.st.State() != stream.StateClosed {
-			e.st.Cancel()
+	if !drainedAll {
+		// Cancel outside the session lock; terminal hooks call back in.
+		for _, e := range entries {
+			if e.st.State() != stream.StateClosed {
+				e.st.Cancel()
+			}
 		}
 	}
 	s.wg.Wait()

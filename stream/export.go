@@ -59,3 +59,4 @@ func (s *Stream) Outcome() Outcome {
 		return OutcomeClosed
 	}
 }
+

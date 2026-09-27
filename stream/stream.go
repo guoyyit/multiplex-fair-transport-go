@@ -572,7 +572,8 @@ func (s *Stream) Offset() Offset {
 	}
 }
 
-// drainDeadline is used by sessions waiting for flush completion.
+// drainDeadline waits until every queued byte and the FIN have been
+// acknowledged, or d elapses.
 func (s *Stream) drainDeadline(d time.Duration) bool {
 	deadline := time.NewTimer(d)
 	defer deadline.Stop()
@@ -580,11 +581,12 @@ func (s *Stream) drainDeadline(d time.Duration) bool {
 	defer ticker.Stop()
 	for {
 		s.mu.Lock()
-		if s.finNotified && s.sendBase == s.sendNext {
-			s.mu.Unlock()
+		drained := s.sendBase == s.sendNext && s.finNotified &&
+			s.queueBytesLocked() == 0
+		s.mu.Unlock()
+		if drained {
 			return true
 		}
-		s.mu.Unlock()
 		select {
 		case <-deadline.C:
 			return false
