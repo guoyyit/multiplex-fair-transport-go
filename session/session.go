@@ -67,7 +67,6 @@ type Session struct {
 	writeMu sync.Mutex // serialises wire writes: no interleaved/half frames
 
 	sched *scheduler.Scheduler
-	flush chan struct{}
 
 	lastActive atomic.Int64 // unix nano of last inbound frame
 
@@ -110,7 +109,6 @@ func newSession(conn transport.Conn, cfg config.Config, client bool, store check
 		streams:   make(map[uint32]*streamEntry),
 		acceptCh:  make(chan *stream.Stream, cfg.AcceptQueue),
 		sched:     scheduler.New(0),
-		flush:     make(chan struct{}, 1),
 		doneCh:    make(chan struct{}),
 		recovered: make(map[uint32]*stream.Offset),
 	}
@@ -241,14 +239,18 @@ func (s *Session) SendFrame(f *frame.Frame) error {
 	return s.writeFrame(f)
 }
 
-// KickSend wakes the send loop.
-func (s *Session) KickSend() { s.kickFlush() }
+// KickSend is retained for the Hooks contract; the scheduler's condition
+// variable delivers wakeups, so no separate kick is required.
+func (s *Session) KickSend() {}
 
-// MarkSendable updates scheduler readiness. Any transition to ready wakes the
-// send loop so newly enqueued data is transmitted without a missed wakeup.
+// MarkSendable updates scheduler readiness. Becoming ready is an idempotent
+// enqueue (SignalReady) that wakes the scheduler condition; becoming not-ready
+// is rare and the send loop discovers it through a nil/empty pop.
 func (s *Session) MarkSendable(id uint32, sendable bool) {
-	if s.sched.SetReady(id, sendable) && sendable {
-		s.kickFlush()
+	if sendable {
+		s.sched.SignalReady(id)
+	} else {
+		s.sched.SetReady(id, false)
 	}
 }
 
@@ -278,41 +280,18 @@ func (s *Session) CloseStream(id uint32) {
 
 // -------------------------------------------------------------- wire write
 
-func (s *Session) kickFlush() {
-	select {
-	case s.flush <- struct{}{}:
-	default:
-	}
-}
-
 // -------------------------------------------------------------- send loop
 
 func (s *Session) sendLoop() {
 	defer s.wg.Done()
 	for {
-		s.mu.Lock()
-		if s.closed {
-			s.mu.Unlock()
+		if !s.sched.Serve(s.serveOne) {
 			return
 		}
+		s.mu.Lock()
+		closed := s.closed
 		s.mu.Unlock()
-		served := false
-		// Serve every currently ready stream once per wakeup; afterwards the
-		// streams that remain sendable re-mark themselves ready.
-		for {
-			id, ok := s.sched.Next()
-			if !ok {
-				break
-			}
-			served = true
-			s.serveOne(id)
-		}
-		if served {
-			continue
-		}
-		select {
-		case <-s.flush:
-		case <-s.doneCh:
+		if closed {
 			return
 		}
 	}
@@ -322,36 +301,27 @@ func (s *Session) exitSignal() <-chan struct{} {
 	return s.doneCh
 }
 
-func (s *Session) serveOne(id uint32) {
+// serveOne pops and transmits one frame, returning keepReady when the stream
+// still has sendable data so the scheduler re-enqueues it.
+func (s *Session) serveOne(id uint32) (keepReady bool) {
 	s.mu.Lock()
 	e, ok := s.streams[id]
 	s.mu.Unlock()
 	if !ok {
-		s.sched.SetReady(id, false)
-		return
+		return false
 	}
-	// PopSendFrame must run without the session lock: stream methods may
-	// call back into session hooks, establishing a consistent lock order
-	// (stream lock -> session lock, never the reverse).
-	f := e.st.PopSendFrame(s.cfg.MaxFramePayload)
+	f := e.st.PopSendRaw(s.cfg.MaxFramePayload)
 	if f == nil {
-		// Window full or nothing queued for now. Synchronize scheduler state
-		// so a subsequent MarkSendable(true) re-enqueues the node even if a
-		// stale readiness flag raced with this pop.
-		s.sched.SetReady(id, false)
-		return
+		return false
 	}
 	if err := s.writeFrame(f); err != nil {
 		s.handleConnFailure(err)
-		return
+		return false
 	}
 	if f.Type == frame.TypeData {
 		s.recordInflight(id, f.Seq, f.Payload)
 	}
-	if e.st.Sendable() {
-		// re-arm without kick: the sendLoop is already iterating its batch
-		s.sched.SetReady(id, true)
-	}
+	return e.st.Sendable()
 }
 
 // writeFrame writes one frame to the current connection without holding the
@@ -541,7 +511,6 @@ func (s *Session) handleAck(f *frame.Frame) {
 		_ = s.saveCheckpointLocked(f.StreamID, e2.st.Offset())
 	}
 	s.mu.Unlock()
-	s.kickFlush()
 }
 
 func (s *Session) handleWindowUpdate(f *frame.Frame) {
@@ -683,6 +652,7 @@ func (s *Session) teardownLocked() {
 		entries = append(entries, e)
 	}
 	s.streams = map[uint32]*streamEntry{}
+	s.sched.Close()
 	if s.conn != nil {
 		_ = s.conn.Close()
 	}
@@ -765,6 +735,7 @@ func (s *Session) closeGraceful(drain bool) error {
 	s.mu.Lock()
 	s.closed = true
 	conn := s.conn
+	s.sched.Close()
 	if s.doneCh != nil {
 		select {
 		case <-s.doneCh:

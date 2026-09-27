@@ -32,9 +32,11 @@ type node struct {
 // Scheduler selects ready streams fairly. All methods are goroutine-safe.
 type Scheduler struct {
 	mu      sync.Mutex
+	cond    *sync.Cond
 	quantum int64
 	nodes   map[uint32]*node
 	rq      readyQueue
+	closed  bool
 }
 
 // New creates a Scheduler with the given stride quantum (0 uses a default).
@@ -42,11 +44,13 @@ func New(quantum int64) *Scheduler {
 	if quantum <= 0 {
 		quantum = DefaultQuantum
 	}
-	return &Scheduler{
+	s := &Scheduler{
 		quantum: quantum,
 		nodes:   make(map[uint32]*node),
 		rq:      make(readyQueue, 0),
 	}
+	s.cond = sync.NewCond(&s.mu)
+	return s
 }
 
 func effectiveWeight(priority, weight int) int64 {
@@ -108,6 +112,7 @@ func (s *Scheduler) SetReady(id uint32, ready bool) bool {
 	if ready && !n.queued {
 		n.queued = true
 		heap.Push(&s.rq, n)
+		s.cond.Broadcast()
 		return true
 	}
 	if !ready && n.queued {
@@ -116,6 +121,29 @@ func (s *Scheduler) SetReady(id uint32, ready bool) bool {
 		return true
 	}
 	return false
+}
+
+// SignalReady idempotently enqueues a stream and wakes a waiter if a new node
+// became ready. It never drops an already-queued node.
+func (s *Scheduler) SignalReady(id uint32) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, ok := s.nodes[id]
+	if !ok || n.queued {
+		return false
+	}
+	n.queued = true
+	heap.Push(&s.rq, n)
+	s.cond.Broadcast()
+	return true
+}
+
+// Close wakes any blocked NextWait so it returns ok=false during shutdown.
+func (s *Scheduler) Close() {
+	s.mu.Lock()
+	s.closed = true
+	s.cond.Broadcast()
+	s.mu.Unlock()
 }
 
 // normalize subtracts the minimum pass from every node so passes cannot
@@ -136,13 +164,53 @@ func (s *Scheduler) normalize() {
 }
 
 // Next returns the next stream id to serve and true, or 0/false if idle. The
-// chosen stream is removed from the ready set; the caller must call
-// SetReady again when the stream is still sendable after popping a frame.
+// chosen stream is removed from the ready set; the caller must re-enqueue it
+// (SetReady/SignalReady) when it remains sendable after popping a frame.
 // Selection is deterministic given the same ready set, priorities and
 // weights.
 func (s *Scheduler) Next() (uint32, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.nextLocked()
+}
+
+// WaitPop atomically pops the highest-priority ready stream, blocking on the
+// condition variable while the ready set is empty. Because the emptiness
+// check and cond.Wait share the scheduler lock, an enqueue that arrives while
+// this call is deciding to park is never missed. Returns ok=false only after
+// Close.
+func (s *Scheduler) WaitPop() (id uint32, ok bool) {
+	s.mu.Lock()
+	for s.rq.Len() == 0 && !s.closed {
+		s.cond.Wait()
+	}
+	id, ok = s.nextLocked()
+	s.mu.Unlock()
+	return id, ok
+}
+
+// Serve atomically pops the next ready stream (parking while idle), runs fn
+// without the scheduler lock, then reconciles queue membership using the
+// keepReady value fn returns. The reconciliation takes no foreign locks, so
+// there is no lock-order inversion; a concurrent SignalReady simply leaves
+// the node enqueued for another attempt. No readiness event is lost.
+func (s *Scheduler) Serve(fn func(id uint32) (keepReady bool)) bool {
+	id, ok := s.WaitPop()
+	if !ok {
+		return false
+	}
+	keep := fn(id)
+	s.mu.Lock()
+	n, exists := s.nodes[id]
+	if exists && keep && !n.queued {
+		n.queued = true
+		heap.Push(&s.rq, n)
+	}
+	s.mu.Unlock()
+	return true
+}
+
+func (s *Scheduler) nextLocked() (uint32, bool) {
 	if s.rq.Len() == 0 {
 		return 0, false
 	}

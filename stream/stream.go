@@ -55,31 +55,21 @@ type Stream struct {
 	finNotified  bool // session notified after send queue drained
 
 	// send side
-	queue       []sendItem
-	sendBase    uint64 // seq of oldest unacked byte
-	sendNext    uint64 // seq after newest enqueued byte
-	inFlight    uint64 // bytes between sendBase and the wire frontier
-	sendWindow  uint64 // peer-advertised receive window
-	maxQueue    int    // bounded queue in bytes
-	spaceSignal chan struct{}
-	queueSignal chan struct{}
+	queue      []sendItem
+	sendBase   uint64 // seq of oldest unacked byte
+	sendNext   uint64 // seq after newest enqueued byte
+	inFlight   uint64 // bytes between sendBase and the wire frontier
+	sendWindow uint64 // peer-advertised receive window
+	maxQueue   int    // bounded queue in bytes
+	sendCond   *sync.Cond
 
 	// receive side
 	recvBuf        bytes.Buffer
 	recvNext       uint64 // next expected inbound sequence
 	recvDelivered  uint64 // bytes consumed by the local reader
 	recvLimit      uint64 // total advertised receive capacity
-	readSignal     chan struct{}
+	readCond       *sync.Cond
 	lastAdConsumed uint64 // reader-consumption offset already advertised
-}
-
-func newSignal() chan struct{} { return make(chan struct{}, 1) }
-
-func signal(ch chan struct{}) {
-	select {
-	case ch <- struct{}{}:
-	default:
-	}
 }
 
 // newStream constructs a stream. recvWindow is the local receive capacity
@@ -88,16 +78,15 @@ func signal(ch chan struct{}) {
 func newStream(id uint32, h Hooks, recvWindow, maxQueue uint64,
 	resume *Offset) *Stream {
 	s := &Stream{
-		id:          id,
-		h:           h,
-		state:       StateOpen,
-		sendWindow:  0,
-		maxQueue:    int(maxQueue),
-		recvLimit:   recvWindow,
-		spaceSignal: newSignal(),
-		queueSignal: newSignal(),
-		readSignal:  newSignal(),
+		id:         id,
+		h:          h,
+		state:      StateOpen,
+		sendWindow: 0,
+		maxQueue:   int(maxQueue),
+		recvLimit:  recvWindow,
 	}
+	s.sendCond = sync.NewCond(&s.mu)
+	s.readCond = sync.NewCond(&s.mu)
 	if resume != nil {
 		s.sendBase = resume.SendAcked
 		s.sendNext = resume.SendNext
@@ -157,50 +146,35 @@ func (s *Stream) Write(p []byte) (int, error) {
 	written := 0
 	for len(p) > 0 {
 		s.mu.Lock()
-		if err := s.writeErrLocked(); err != nil {
-			s.mu.Unlock()
-			return written, err
-		}
-		outstanding := func() uint64 { return s.inFlight + s.queueBytesLocked() }
-		for s.maxQueue > 0 && outstanding() >= uint64(s.maxQueue) {
-			ch := s.queueSignal
-			s.mu.Unlock()
-			select {
-			case <-ch:
-			}
-			s.mu.Lock()
+		for {
 			if err := s.writeErrLocked(); err != nil {
 				s.mu.Unlock()
 				return written, err
 			}
-		}
-		var room uint64
-		if s.maxQueue > 0 && outstanding() < uint64(s.maxQueue) {
-			room = uint64(s.maxQueue) - outstanding()
-		} else if s.maxQueue <= 0 {
-			room = uint64(len(p))
-		}
-		if room == 0 {
-			ch := s.queueSignal
-			s.mu.Unlock()
-			select {
-			case <-ch:
+			var room uint64
+			outstanding := s.inFlight + s.queueBytesLocked()
+			if s.maxQueue <= 0 {
+				room = uint64(len(p))
+			} else if outstanding < uint64(s.maxQueue) {
+				room = uint64(s.maxQueue) - outstanding
 			}
-			continue
+			if room > 0 {
+				chunk := p
+				if uint64(len(chunk)) > room {
+					chunk = chunk[:room]
+				}
+				buf := make([]byte, len(chunk))
+				copy(buf, chunk)
+				s.queue = append(s.queue, sendItem{seq: s.sendNext, buf: buf})
+				s.sendNext += uint64(len(buf))
+				s.mu.Unlock()
+				written += len(buf)
+				p = p[len(buf):]
+				s.notifyReady()
+				break
+			}
+			s.sendCond.Wait()
 		}
-		chunk := p
-		if uint64(len(chunk)) > room {
-			chunk = chunk[:room]
-		}
-		seq := s.sendNext
-		buf := make([]byte, len(chunk))
-		copy(buf, chunk)
-		s.queue = append(s.queue, sendItem{seq: seq, buf: buf})
-		s.sendNext += uint64(len(buf))
-		s.mu.Unlock()
-		written += len(buf)
-		p = p[len(buf):]
-		s.refreshSendable()
 	}
 	return written, nil
 }
@@ -218,13 +192,19 @@ func (s *Stream) writeErrLocked() error {
 	return nil
 }
 
-// refreshSendable recomputes scheduler readiness.
-func (s *Stream) refreshSendable() {
+// notifyReady enqueues the stream if it currently has sendable data. It never
+// dequeues; readiness loss is discovered by a nil pop in the send loop.
+func (s *Stream) notifyReady() {
 	s.mu.Lock()
 	ready := s.sendableLocked()
 	s.mu.Unlock()
-	s.h.MarkSendable(s.id, ready)
+	if ready {
+		s.h.MarkSendable(s.id, true)
+	}
 }
+
+// refreshSendable recomputes scheduler readiness.
+func (s *Stream) refreshSendable() { s.notifyReady() }
 
 // PopSend returns the next data frame for the wire when the window permits,
 // marking its bytes in flight. Returns nil when nothing can be sent now.
@@ -261,6 +241,8 @@ func (s *Stream) PopSend(maxPayload int) *frame.Frame {
 			s.queue[0].seq += n
 			s.queue[0].buf = it.buf[n:]
 		}
+		// Bytes moved queue -> in-flight: wake writers blocked on memory.
+		s.sendCond.Broadcast()
 		return f
 	}
 	// FIN is emitted only once all preceding data has been popped and
@@ -291,8 +273,15 @@ func (s *Stream) HandleAck(ackedSeq uint64) {
 		return
 	}
 	s.sendBase = ackedSeq
+	ready := s.sendableLocked()
 	finDone := s.finNotified && s.sendBase == s.sendNext
 	s.mu.Unlock()
+	// Only positive transitions enqueue; popping is the scheduler's own job,
+	// so an ack never incorrectly removes a node that fresh credit may make
+	// ready. An ack can make a pending FIN sendable.
+	if ready {
+		s.h.MarkSendable(s.id, true)
+	}
 	if finDone {
 		s.maybeNotifyClosed()
 	}
@@ -306,12 +295,12 @@ func (s *Stream) HandleWindowUpdate(credit uint64) {
 		credit = s.inFlight
 	}
 	s.inFlight -= credit
-	signal(s.spaceSignal)
-	signal(s.queueSignal)
+	s.sendCond.Broadcast()
 	ready := s.sendableLocked()
 	s.mu.Unlock()
-	s.h.MarkSendable(s.id, ready)
-	s.h.KickSend()
+	if ready {
+		s.h.MarkSendable(s.id, true)
+	}
 }
 
 // -------------------------------------------------------------- recv side
@@ -348,7 +337,7 @@ func (s *Stream) PushData(seq uint64, payload []byte) bool {
 	s.recvBuf.Write(payload)
 	s.recvNext += uint64(len(payload))
 	acked := s.recvNext
-	signal(s.readSignal)
+	s.readCond.Broadcast()
 	s.mu.Unlock()
 	s.sendAck(acked)
 	return true
@@ -368,17 +357,14 @@ func (s *Stream) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
+	s.mu.Lock()
 	for {
-		s.mu.Lock()
 		if s.reset {
 			s.mu.Unlock()
 			return 0, ErrReset
 		}
 		if s.recvBuf.Len() > 0 {
 			n, _ := s.recvBuf.Read(p)
-			if s.recvBuf.Len() == 0 {
-				signal(s.readSignal)
-			}
 			s.mu.Unlock()
 			s.afterRead(uint64(n))
 			return n, nil
@@ -395,9 +381,9 @@ func (s *Stream) Read(p []byte) (int, error) {
 			s.mu.Unlock()
 			return 0, ErrClosedStream
 		}
-		ch := s.readSignal
-		s.mu.Unlock()
-		<-ch
+		// Wait returns holding s.mu, so the loop re-checks predicates
+		// directly without re-locking.
+		s.readCond.Wait()
 	}
 }
 
@@ -450,7 +436,7 @@ func (s *Stream) CloseRead() error {
 	s.mu.Lock()
 	s.readClosed = true
 	s.recvBuf.Reset()
-	signal(s.readSignal)
+	s.readCond.Broadcast()
 	s.mu.Unlock()
 	return nil
 }
@@ -473,7 +459,7 @@ func (s *Stream) HandleClose(flag uint8) {
 		} else {
 			s.state = StateHalfClosedRemote
 		}
-		signal(s.readSignal)
+		s.readCond.Broadcast()
 	}
 	terminal := s.state == StateClosed
 	s.mu.Unlock()
@@ -486,9 +472,8 @@ func (s *Stream) HandleClose(flag uint8) {
 func (s *Stream) resetInternal() {
 	s.reset = true
 	s.state = StateClosed
-	signal(s.spaceSignal)
-	signal(s.queueSignal)
-	signal(s.readSignal)
+	s.sendCond.Broadcast()
+	s.readCond.Broadcast()
 }
 
 // Reset marks the stream reset by the peer and wakes all blocked operations.
@@ -511,9 +496,8 @@ func (s *Stream) Cancel() {
 	if !already {
 		s.cancelled = true
 		s.state = StateClosed
-		signal(s.spaceSignal)
-		signal(s.queueSignal)
-		signal(s.readSignal)
+		s.sendCond.Broadcast()
+		s.readCond.Broadcast()
 	}
 	s.mu.Unlock()
 	if !already {
