@@ -54,7 +54,6 @@ func (s *Stream) Outcome() Outcome {
 	}
 }
 
-
 func (s *Stream) DebugStateExport() (sendWindow, inFlight, sendBase, sendNext uint64, queued int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

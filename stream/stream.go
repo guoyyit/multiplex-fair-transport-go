@@ -15,10 +15,10 @@ import (
 type State uint8
 
 const (
-	StateOpen State = iota // both directions open
-	StateHalfClosedLocal   // local writes finished (FIN enqueued/sent)
-	StateHalfClosedRemote  // remote writes finished (FIN received)
-	StateClosed            // fully closed (both directions done, or reset)
+	StateOpen             State = iota // both directions open
+	StateHalfClosedLocal               // local writes finished (FIN enqueued/sent)
+	StateHalfClosedRemote              // remote writes finished (FIN received)
+	StateClosed                        // fully closed (both directions done, or reset)
 )
 
 // Outcome describes why a stream entered terminal state.

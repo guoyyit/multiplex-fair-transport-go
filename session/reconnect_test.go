@@ -35,10 +35,10 @@ func TestReconnectNoneFails(t *testing.T) {
 
 // flakyDialer serves successive fresh connections, counting dial attempts.
 type flakyDialer struct {
-	mu      sync.Mutex
-	dials   atomic.Int32
-	server  *Session
-	cfg     config.Config
+	mu     sync.Mutex
+	dials  atomic.Int32
+	server *Session
+	cfg    config.Config
 }
 
 func (d *flakyDialer) Dial() (transport.Conn, error) {

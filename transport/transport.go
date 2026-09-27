@@ -20,7 +20,7 @@ type Conn interface {
 // buffered data has been drained.
 type ErrClosed struct{}
 
-func (e *ErrClosed) Error() string { return "transport: connection closed"}
+func (e *ErrClosed) Error() string { return "transport: connection closed" }
 
 // pipeHalf is one direction of the in-memory pipe.
 type pipeHalf struct {

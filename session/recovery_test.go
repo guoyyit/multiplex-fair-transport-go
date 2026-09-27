@@ -11,6 +11,7 @@ import (
 // During transfer the session durably records:
 //   - sender: SendNext grows as bytes are enqueued, SendAcked on ack
 //   - receiver: RecvNext grows on in-order frames, RecvDelivered on Read
+//
 // Rebuilding a stream from those offsets must resume at exactly them, so no
 // confirmed byte is re-sent from sequence 0 and no consumed byte is
 // redelivered.

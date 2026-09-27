@@ -54,14 +54,14 @@ type Config struct {
 // Defaults returns a configuration with sane defaults.
 func Defaults() Config {
 	return Config{
-		InitialWindow:   64 << 10,
-		MaxFramePayload: 16 << 10,
-		AcceptQueue:     64,
+		InitialWindow:     64 << 10,
+		MaxFramePayload:   16 << 10,
+		AcceptQueue:       64,
 		HeartbeatInterval: 15 * time.Second,
-		IdleTimeout:      30 * time.Second,
-		DrainTimeout:     5 * time.Second,
-		Reconnect:        ReconnectNone,
-		ReconnectBackoff: 100 * time.Millisecond,
+		IdleTimeout:       30 * time.Second,
+		DrainTimeout:      5 * time.Second,
+		Reconnect:         ReconnectNone,
+		ReconnectBackoff:  100 * time.Millisecond,
 	}
 }
 

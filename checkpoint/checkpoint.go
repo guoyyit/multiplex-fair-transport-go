@@ -14,10 +14,10 @@ import (
 // StreamOffset records durable offsets for one stream.
 type StreamOffset struct {
 	StreamID      uint32 `json:"stream_id"`
-	SendAcked     uint64 `json:"send_acked"`    // bytes acknowledged by the peer
-	SendNext      uint64 `json:"send_next"`     // next byte sequence to send
+	SendAcked     uint64 `json:"send_acked"`     // bytes acknowledged by the peer
+	SendNext      uint64 `json:"send_next"`      // next byte sequence to send
 	RecvDelivered uint64 `json:"recv_delivered"` // highest contiguous byte delivered
-	RecvNext      uint64 `json:"recv_next"`     // next expected inbound sequence
+	RecvNext      uint64 `json:"recv_next"`      // next expected inbound sequence
 }
 
 // Store persists stream offsets.
