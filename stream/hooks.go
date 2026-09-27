@@ -13,6 +13,8 @@ type Hooks interface {
 	// MarkSendable notifies the scheduler that the stream gained/lost data
 	// eligible for transmission (non-empty send queue AND open send window).
 	MarkSendable(id uint32, sendable bool)
+	// KickSend wakes the send loop after window capacity may have changed.
+	KickSend()
 }
 
 // Errors returned by stream operations.

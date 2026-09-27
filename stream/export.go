@@ -60,3 +60,29 @@ func (s *Stream) Outcome() Outcome {
 	}
 }
 
+
+func (s *Stream) DebugStateExport() (sendWindow, inFlight, sendBase, sendNext uint64, queued int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sendWindow, s.inFlight, s.sendBase, s.sendNext, len(s.queue)
+}
+
+// SetPeerWindow records the initial receive window the peer advertised in the
+// OPEN handshake. It must be called before any data is sent.
+func (s *Stream) SetPeerWindow(w uint64) {
+	s.mu.Lock()
+	s.sendWindow = w
+	s.mu.Unlock()
+}
+
+// WakeWriters unblocks writers after the peer's initial window becomes known.
+// It always notifies the scheduler loop because blocked writers may be parked
+// with an empty queue at the instant the window is established.
+func (s *Stream) WakeWriters() {
+	s.mu.Lock()
+	ready := s.sendableLocked()
+	signal(s.spaceSignal)
+	s.mu.Unlock()
+	s.h.MarkSendable(s.id, ready)
+	s.h.KickSend()
+}

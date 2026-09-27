@@ -171,7 +171,10 @@ func (s *Session) OpenStream(ctx context.Context, priority, weight int) (*stream
 	st := s.newStreamLocked(id, priority, weight, nil)
 	off := st.Offset()
 	_ = s.saveCheckpointLocked(id, off)
-	payload := encodeOpenPayload(priority, weight)
+	// Local stream cannot send until the peer grants its receive window; the
+	// OPEN carries our receive window for the peer's direction.
+	st.SetPeerWindow(0)
+	payload := encodeOpenPayload(priority, weight, s.cfg.InitialWindow)
 	openFrame := &frame.Frame{Type: frame.TypeOpen, StreamID: id, Payload: payload}
 	s.mu.Unlock()
 	if err := s.writeFrame(openFrame); err != nil {
@@ -182,18 +185,21 @@ func (s *Session) OpenStream(ctx context.Context, priority, weight int) (*stream
 	return st, nil
 }
 
-func encodeOpenPayload(priority, weight int) []byte {
-	p := make([]byte, 8)
+func encodeOpenPayload(priority, weight int, window uint64) []byte {
+	p := make([]byte, 16)
 	binary.BigEndian.PutUint32(p[0:4], uint32(priority))
 	binary.BigEndian.PutUint32(p[4:8], uint32(weight))
+	binary.BigEndian.PutUint64(p[8:16], window)
 	return p
 }
 
-func decodeOpenPayload(p []byte) (priority, weight int, ok bool) {
-	if len(p) != 8 {
-		return 0, 0, false
+func decodeOpenPayload(p []byte) (priority, weight int, window uint64, ok bool) {
+	if len(p) != 16 {
+		return 0, 0, 0, false
 	}
-	return int(binary.BigEndian.Uint32(p[0:4])), int(binary.BigEndian.Uint32(p[4:8])), true
+	return int(binary.BigEndian.Uint32(p[0:4])),
+		int(binary.BigEndian.Uint32(p[4:8])),
+		binary.BigEndian.Uint64(p[8:16]), true
 }
 
 // AcceptStream returns the next stream opened by the peer.
@@ -234,6 +240,9 @@ func (s *Session) SendFrame(f *frame.Frame) error {
 	s.mu.Unlock()
 	return s.writeFrame(f)
 }
+
+// KickSend wakes the send loop.
+func (s *Session) KickSend() { s.kickFlush() }
 
 // MarkSendable updates scheduler readiness. Any transition to ready wakes the
 // send loop so newly enqueued data is transmitted without a missed wakeup.
@@ -443,9 +452,21 @@ func (s *Session) dispatch(f *frame.Frame) {
 }
 
 func (s *Session) handleOpen(f *frame.Frame) {
-	priority, weight, ok := decodeOpenPayload(f.Payload)
+	priority, weight, peerWindow, ok := decodeOpenPayload(f.Payload)
 	if !ok {
 		return // malformed open: ignore stream
+	}
+	// OPEN acknowledgement for a stream this side initiated: learn the
+	// responder's receive window and let blocked writers proceed.
+	if f.Flags&openAckFlag != 0 {
+		s.mu.Lock()
+		e, exists := s.streams[f.StreamID]
+		s.mu.Unlock()
+		if exists {
+			e.st.SetPeerWindow(peerWindow)
+			e.st.WakeWriters()
+		}
+		return
 	}
 	s.mu.Lock()
 	if s.closed || s.stopping {
@@ -457,14 +478,24 @@ func (s *Session) handleOpen(f *frame.Frame) {
 		return
 	}
 	st := s.newStreamLocked(f.StreamID, priority, weight, nil)
+	st.SetPeerWindow(peerWindow)
 	_ = s.saveCheckpointLocked(f.StreamID, st.Offset())
+	ackFrame := &frame.Frame{
+		Type: frame.TypeOpen, Flags: openAckFlag, StreamID: f.StreamID,
+		Payload: encodeOpenPayload(priority, weight, s.cfg.InitialWindow),
+	}
 	s.mu.Unlock()
+	_ = s.writeFrame(ackFrame)
 	select {
 	case s.acceptCh <- st:
 	default:
 		st.Reset() // accept queue full
 	}
 }
+
+// openAckFlag marks an OPEN frame as the handshake acknowledgement carrying
+// the responder's receive window.
+const openAckFlag uint8 = 0x01
 
 func (s *Session) handleData(f *frame.Frame) {
 	s.mu.Lock()

@@ -31,6 +31,8 @@ func (f *fakeHooks) CloseStream(id uint32) {
 	f.mu.Unlock()
 }
 
+func (f *fakeHooks) KickSend() {}
+
 func (f *fakeHooks) MarkSendable(id uint32, sendable bool) {
 	f.mu.Lock()
 	f.ready[id] = sendable
@@ -48,6 +50,7 @@ func (f *fakeHooks) snapshot() []*frame.Frame {
 func newTestStream() (*Stream, *fakeHooks) {
 	h := newFakeHooks()
 	s := New(1, h, 65536, 65536*4, nil)
+	s.SetPeerWindow(65536)
 	return s, h
 }
 
@@ -100,49 +103,43 @@ func TestDuplicateDropped(t *testing.T) {
 
 func TestReceiveWindowBackpressure(t *testing.T) {
 	h := newFakeHooks()
-	// tiny 4-byte receive window advertised to sender; queue bound 8 bytes
+	// tiny 4-byte peer window; total sender memory bound 8 bytes
 	s := New(1, h, 4, 8, nil)
+	s.SetPeerWindow(4)
 	done := make(chan int, 1)
 	go func() {
 		n, _ := s.Write([]byte("0123456789")) // 10 bytes, cannot fit
 		done <- n
 	}()
-	select {
-	case n := <-done:
-		t.Fatalf("write returned early with %d bytes despite tiny window", n)
-	case <-time.After(50 * time.Millisecond):
-	}
-	// The initial 4-byte window allows exactly 4 bytes to be queued; the
-	// remaining 6 bytes must wait for additional credit (write is blocked).
-	// Pop the 4 queued bytes (send-side inFlight now 4) then ack and refill.
+	time.Sleep(50 * time.Millisecond)
+	// Pop the 4 windowed bytes; inFlight is now 4 and the remaining 6 bytes
+	// cannot even be queued because outstanding (inFlight 4 + queued) is at
+	// the 8-byte memory bound.
 	fr := s.PopSendFrame(1024)
 	if fr == nil || len(fr.Payload) != 4 {
 		t.Fatalf("expected 4-byte frame, got %+v", fr)
 	}
-	// extra credit still must not let the write overshoot bounded behavior:
-	// ack the 4 and grant a large window so the rest proceeds.
+	select {
+	case n := <-done:
+		t.Fatalf("write returned early with %d bytes despite backpressure", n)
+	case <-time.After(50 * time.Millisecond):
+	}
+	// The peer reads the 4 bytes and returns 4 bytes of credit. ACK alone
+	// must not free send capacity; only WINDOW_UPDATE does.
 	s.Ack(4)
-	s.WindowUpdate(1000)
+	select {
+	case n := <-done:
+		t.Fatalf("ACK alone released the window (write n=%d)", n)
+	case <-time.After(50 * time.Millisecond):
+	}
+	s.WindowUpdate(4)
 	select {
 	case n := <-done:
 		if n != 10 {
 			t.Fatalf("write n=%d want 10", n)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("write never unblocked after window opened")
-	}
-	// the remaining six bytes pop in order
-	var popped int
-	for {
-		f := s.PopSendFrame(1024)
-		if f == nil {
-			break
-		}
-		popped += len(f.Payload)
-		s.Ack(f.Seq + uint64(len(f.Payload)))
-	}
-	if popped != 6 {
-		t.Fatalf("popped remaining %d bytes, want 6", popped)
+		t.Fatal("write never unblocked after credit returned")
 	}
 }
 

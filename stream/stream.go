@@ -65,11 +65,12 @@ type Stream struct {
 	queueSignal chan struct{}
 
 	// receive side
-	recvBuf      bytes.Buffer
-	recvNext     uint64 // next expected inbound sequence
-	recvDelivered uint64 // highest contiguous sequence consumed? tracked by buf consumption
-	readSignal   chan struct{}
-	lastAdCredit uint64 // advertised credit already granted on top of initial
+	recvBuf        bytes.Buffer
+	recvNext       uint64 // next expected inbound sequence
+	recvDelivered  uint64 // bytes consumed by the local reader
+	recvLimit      uint64 // total advertised receive capacity
+	readSignal     chan struct{}
+	lastAdConsumed uint64 // reader-consumption offset already advertised
 }
 
 func newSignal() chan struct{} { return make(chan struct{}, 1) }
@@ -81,16 +82,18 @@ func signal(ch chan struct{}) {
 	}
 }
 
-// newStream constructs a stream. New methods are package-private on purpose;
-// sessions create streams.
-func newStream(id uint32, h Hooks, initialWindow, maxQueue uint64,
+// newStream constructs a stream. recvWindow is the local receive capacity
+// advertised to the peer; the sender-side window starts at zero and grows only
+// via the peer's OPEN initial window and subsequent WINDOW_UPDATE frames.
+func newStream(id uint32, h Hooks, recvWindow, maxQueue uint64,
 	resume *Offset) *Stream {
 	s := &Stream{
 		id:          id,
 		h:           h,
 		state:       StateOpen,
-		sendWindow:  initialWindow,
+		sendWindow:  0,
 		maxQueue:    int(maxQueue),
+		recvLimit:   recvWindow,
 		spaceSignal: newSignal(),
 		queueSignal: newSignal(),
 		readSignal:  newSignal(),
@@ -134,7 +137,8 @@ func (s *Stream) finPendingLocked() bool {
 	return s.sendClosed && !s.finNotified && s.inFlight == 0 && s.queueBytesLocked() == 0
 }
 
-// sendableLocked reports whether the scheduler may pop a frame now.
+// sendableLocked reports whether the scheduler may pop a data frame now:
+// queued data exists and the in-flight count is below the peer window.
 func (s *Stream) sendableLocked() bool {
 	if s.inFlight < s.sendWindow && s.queueBytesLocked() > 0 {
 		return true
@@ -144,9 +148,11 @@ func (s *Stream) sendableLocked() bool {
 
 // ---------------------------------------------------------------- send side
 
-// Write implements io.Writer. It enqueues bounded, framed chunks and blocks
-// when the stream's send window or its bounded queue is exhausted; a slow
-// stream therefore blocks only its own writers and never another stream.
+// Write implements io.Writer. Bytes are appended to the stream's bounded send
+// queue. Total outstanding sender memory (in-flight frames plus queued bytes)
+// is bounded by maxQueue: when a non-reading peer keeps the send window shut,
+// Write blocks and exerts backpressure on that stream's writers only — never
+// on another stream.
 func (s *Stream) Write(p []byte) (int, error) {
 	written := 0
 	for len(p) > 0 {
@@ -155,9 +161,8 @@ func (s *Stream) Write(p []byte) (int, error) {
 			s.mu.Unlock()
 			return written, err
 		}
-		// Bound in-memory buffering: never hold more than maxQueue queued
-		// bytes per stream.
-		for s.maxQueue > 0 && s.queueBytesLocked() >= uint64(s.maxQueue) {
+		outstanding := func() uint64 { return s.inFlight + s.queueBytesLocked() }
+		for s.maxQueue > 0 && outstanding() >= uint64(s.maxQueue) {
 			ch := s.queueSignal
 			s.mu.Unlock()
 			select {
@@ -169,17 +174,14 @@ func (s *Stream) Write(p []byte) (int, error) {
 				return written, err
 			}
 		}
-		// Outstanding = bytes already on the wire (inFlight) + bytes queued
-		// but not yet transmitted. The peer window bounds the sum, so new
-		// bytes are accepted only up to the remaining room.
-		outstanding := s.inFlight + s.queueBytesLocked()
 		var room uint64
-		if outstanding < s.sendWindow {
-			room = s.sendWindow - outstanding
+		if s.maxQueue > 0 && outstanding() < uint64(s.maxQueue) {
+			room = uint64(s.maxQueue) - outstanding()
+		} else if s.maxQueue <= 0 {
+			room = uint64(len(p))
 		}
 		if room == 0 {
-			// Window full: block until an ack/window-update opens room.
-			ch := s.spaceSignal
+			ch := s.queueSignal
 			s.mu.Unlock()
 			select {
 			case <-ch:
@@ -195,8 +197,6 @@ func (s *Stream) Write(p []byte) (int, error) {
 		copy(buf, chunk)
 		s.queue = append(s.queue, sendItem{seq: seq, buf: buf})
 		s.sendNext += uint64(len(buf))
-		wasSendable := s.sendableLocked()
-		_ = wasSendable
 		s.mu.Unlock()
 		written += len(buf)
 		p = p[len(buf):]
@@ -237,11 +237,12 @@ func (s *Stream) PopSend(maxPayload int) *frame.Frame {
 		return nil
 	}
 	room := s.sendWindow - s.inFlight
-	// find first queued item
+	if uint64(maxPayload) > 0 && room > uint64(maxPayload) {
+		room = uint64(maxPayload)
+	}
 	for len(s.queue) > 0 {
 		it := s.queue[0]
 		if it.fin {
-			// FIN only after data drained; data items precede it.
 			break
 		}
 		n := uint64(len(it.buf))
@@ -254,7 +255,6 @@ func (s *Stream) PopSend(maxPayload int) *frame.Frame {
 		payload := it.buf[:n]
 		f := &frame.Frame{Type: frame.TypeData, StreamID: s.id, Seq: it.seq, Payload: append([]byte(nil), payload...)}
 		s.inFlight += n
-		// leave remaining bytes in the item (partial pop under window)
 		if n == uint64(len(it.buf)) {
 			s.queue = s.queue[1:]
 		} else {
@@ -275,8 +275,10 @@ func (s *Stream) PopSend(maxPayload int) *frame.Frame {
 }
 
 // HandleAck processes an inbound cumulative ack: ackedSeq is the next byte the
-// peer expects, i.e. all lower sequences are received. Sliding the window
-// wakes blocked writers and frees queue backpressure.
+// peer expects. An ACK only advances the replay/durability frontier
+// (sendBase); it does NOT free send permission. Send capacity is released
+// exclusively by WINDOW_UPDATE, which the receiver emits only after its reader
+// consumes data, so a non-reading peer keeps the sender truly backpressured.
 func (s *Stream) HandleAck(ackedSeq uint64) {
 	s.mu.Lock()
 	if ackedSeq < s.sendBase {
@@ -288,32 +290,28 @@ func (s *Stream) HandleAck(ackedSeq uint64) {
 		s.resetInternal()
 		return
 	}
-	advanced := ackedSeq - s.sendBase
-	if advanced > s.inFlight {
-		advanced = s.inFlight
-	}
 	s.sendBase = ackedSeq
-	s.inFlight -= advanced
-	// queued items that were fully acked (popped earlier); nothing to trim.
-	signal(s.spaceSignal)
-	signal(s.queueSignal)
-	ready := s.sendableLocked()
-	finDone := s.finNotified
+	finDone := s.finNotified && s.sendBase == s.sendNext
 	s.mu.Unlock()
-	s.h.MarkSendable(s.id, ready)
 	if finDone {
 		s.maybeNotifyClosed()
 	}
 }
 
-// HandleWindowUpdate grants incremental send credit.
+// HandleWindowUpdate releases consumed receive credit: the receiver's reader
+// drained `credit` bytes, freeing the same amount of sender in-flight budget.
 func (s *Stream) HandleWindowUpdate(credit uint64) {
 	s.mu.Lock()
-	s.sendWindow += credit
+	if credit > s.inFlight {
+		credit = s.inFlight
+	}
+	s.inFlight -= credit
 	signal(s.spaceSignal)
+	signal(s.queueSignal)
 	ready := s.sendableLocked()
 	s.mu.Unlock()
 	s.h.MarkSendable(s.id, ready)
+	s.h.KickSend()
 }
 
 // -------------------------------------------------------------- recv side
@@ -356,27 +354,12 @@ func (s *Stream) PushData(seq uint64, payload []byte) bool {
 	return true
 }
 
-// sendAck sends a cumulative ack and, when the reader has drained enough data,
-// a window-update that replenishes the consumed receive credit.
+// sendAck sends a cumulative ack. Receive credit is returned separately and
+// only after the local reader consumes data (see afterRead), so a non-reading
+// peer keeps the sender blocked at the initial window instead of growing the
+// window without bound.
 func (s *Stream) sendAck(nextSeq uint64) {
 	_ = s.h.SendFrame(&frame.Frame{Type: frame.TypeAck, StreamID: s.id, Seq: nextSeq})
-	s.mu.Lock()
-	// recvNext - recvDelivered approximates unread buffered bytes; credit
-	// is returned for data the reader has consumed beyond the last ad.
-	unread := uint64(s.recvBuf.Len())
-	consumed := s.recvNext - unread
-	credit := uint64(0)
-	baseWindow := s.recvNext - s.lastAdCredit // not directly used
-	_ = baseWindow
-	// Grant credit for bytes consumed since previous advertisement.
-	if consumed > s.lastAdCredit {
-		credit = consumed - s.lastAdCredit
-		s.lastAdCredit = consumed
-	}
-	s.mu.Unlock()
-	if credit > 0 {
-		_ = s.h.SendFrame(&frame.Frame{Type: frame.TypeWindowUpdate, StreamID: s.id, Seq: credit})
-	}
 }
 
 // Read delivers data strictly in sequence. It blocks until data, EOF, reset
@@ -429,9 +412,9 @@ func (s *Stream) afterRead(n uint64) {
 
 func (s *Stream) maybeAdvertise() {
 	s.mu.Lock()
-	if s.recvDelivered > s.lastAdCredit {
-		credit := s.recvDelivered - s.lastAdCredit
-		s.lastAdCredit = s.recvDelivered
+	if s.recvDelivered > s.lastAdConsumed {
+		credit := s.recvDelivered - s.lastAdConsumed
+		s.lastAdConsumed = s.recvDelivered
 		s.mu.Unlock()
 		_ = s.h.SendFrame(&frame.Frame{Type: frame.TypeWindowUpdate, StreamID: s.id, Seq: credit})
 		return
