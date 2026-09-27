@@ -252,7 +252,11 @@ func (s *Session) MarkSendable(id uint32, sendable bool) {
 	}
 }
 
-// CloseStream is the terminal hook for a stream.
+// CloseStream is the terminal hook for a stream. The latest offsets are always
+// persisted first; the durable record is deleted only for a clean close (fully
+// acknowledged data exchange). Cancellation or reset retains the checkpoint so
+// a restarted process can recover send/receive positions instead of losing or
+// reusing confirmed offsets.
 func (s *Session) CloseStream(id uint32) {
 	s.mu.Lock()
 	e, ok := s.streams[id]
@@ -261,14 +265,13 @@ func (s *Session) CloseStream(id uint32) {
 		return
 	}
 	off := e.st.Offset()
+	outcome := e.st.Outcome()
 	_ = s.saveCheckpointLocked(id, off)
 	s.sched.SetReady(id, false)
 	s.sched.Remove(id)
 	delete(s.streams, id)
-	closed := s.closed
 	s.mu.Unlock()
-	_ = closed
-	if s.store != nil {
+	if s.store != nil && outcome == stream.OutcomeClosed {
 		_ = s.store.Delete(id)
 	}
 }
@@ -376,6 +379,9 @@ func (s *Session) recordInflight(id uint32, seq uint64, payload []byte) {
 	}
 	cp := append([]byte(nil), payload...)
 	e.retry = append(e.retry, retryItem{seq: seq, payload: cp})
+	// Durably advance the send frontier so a crash between now and the ack
+	// resumes after these bytes rather than reusing their sequences.
+	_ = s.saveCheckpointLocked(id, e.st.Offset())
 }
 
 // -------------------------------------------------------------- read loop
@@ -779,6 +785,16 @@ func (s *Session) closeGraceful(drain bool) error {
 		}
 	}
 	s.wg.Wait()
+	// The checkpoint store is owned by the caller and deliberately NOT
+	// closed here: crash recovery hands the same store to a fresh session.
+	// Close it explicitly with CloseCheckpoint when recovery is no longer
+	// needed.
+	return nil
+}
+
+// CloseCheckpoint releases the durable offset store. After this call the
+// session cannot recover further streams.
+func (s *Session) CloseCheckpoint() error {
 	if s.store != nil {
 		return s.store.Close()
 	}

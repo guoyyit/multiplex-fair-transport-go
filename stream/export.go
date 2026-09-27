@@ -86,3 +86,11 @@ func (s *Stream) WakeWriters() {
 	s.h.MarkSendable(s.id, ready)
 	s.h.KickSend()
 }
+
+// OffsetExport returns the durable stream offsets.
+func (s *Stream) OffsetExport() Offset { return s.Offset() }
+
+// PopSendFrameExport exposes a single send pop for recovery verification.
+func (s *Stream) PopSendFrameExport(maxPayload int) *frame.Frame {
+	return s.PopSend(maxPayload)
+}
