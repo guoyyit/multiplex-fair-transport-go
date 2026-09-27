@@ -4,6 +4,7 @@ package stream
 
 import (
 	"bytes"
+	"io"
 	"sync"
 	"time"
 
@@ -168,13 +169,15 @@ func (s *Stream) Write(p []byte) (int, error) {
 				return written, err
 			}
 		}
-		chunk := p
-		if uint64(len(chunk)) > s.sendWindow-s.inFlight-s.queueBytesLocked() {
-			if room := s.sendWindow - s.inFlight - s.queueBytesLocked(); room > 0 {
-				chunk = chunk[:room]
-			}
+		// Outstanding = bytes already on the wire (inFlight) + bytes queued
+		// but not yet transmitted. The peer window bounds the sum, so new
+		// bytes are accepted only up to the remaining room.
+		outstanding := s.inFlight + s.queueBytesLocked()
+		var room uint64
+		if outstanding < s.sendWindow {
+			room = s.sendWindow - outstanding
 		}
-		if uint64(len(chunk)) == 0 {
+		if room == 0 {
 			// Window full: block until an ack/window-update opens room.
 			ch := s.spaceSignal
 			s.mu.Unlock()
@@ -182,6 +185,10 @@ func (s *Stream) Write(p []byte) (int, error) {
 			case <-ch:
 			}
 			continue
+		}
+		chunk := p
+		if uint64(len(chunk)) > room {
+			chunk = chunk[:room]
 		}
 		seq := s.sendNext
 		buf := make([]byte, len(chunk))
@@ -399,7 +406,7 @@ func (s *Stream) Read(p []byte) (int, error) {
 		}
 		if s.remoteClosed {
 			s.mu.Unlock()
-			return 0, nil // clean EOF
+			return 0, io.EOF
 		}
 		if s.readClosed {
 			s.mu.Unlock()
